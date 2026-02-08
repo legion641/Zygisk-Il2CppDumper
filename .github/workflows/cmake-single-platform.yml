@@ -1,0 +1,204 @@
+# This workflow builds Zygisk-Il2CppDumper for Android using NDK
+name: Build Zygisk-Il2CppDumper
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86_64]
+        include:
+          - abi: arm64-v8a
+            platform: android-24
+          - abi: armeabi-v7a
+            platform: android-24
+          - abi: x86_64
+            platform: android-24
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Setup Android NDK
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: 'r25c'
+    
+    - name: Install CMake and Ninja
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake ninja-build
+    
+    - name: Configure CMake
+      run: |
+        mkdir -p build-${{ matrix.abi }}
+        cd build-${{ matrix.abi }}
+        cmake .. \
+          -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
+          -DANDROID_ABI=${{ matrix.abi }} \
+          -DANDROID_PLATFORM=${{ matrix.platform }} \
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+          -GNinja
+    
+    - name: Build
+      run: |
+        cd build-${{ matrix.abi }}
+        ninja
+    
+    - name: List output files
+      run: |
+        echo "Build output for ${{ matrix.abi }}:"
+        ls -la build-${{ matrix.abi }}/
+    
+    - name: Upload built library
+      uses: actions/upload-artifact@v4
+      with:
+        name: Il2CppDumper-${{ matrix.abi }}
+        path: build-${{ matrix.abi }}/Il2CppDumper.so
+  
+  create-module:
+    runs-on: ubuntu-latest
+    needs: build-android
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+    - name: Download all artifacts
+      run: |
+        mkdir -p artifacts
+        mkdir -p artifacts/arm64-v8a
+        mkdir -p artifacts/armeabi-v7a
+        mkdir -p artifacts/x86_64
+    
+    - name: Checkout repository for module files
+      uses: actions/checkout@v4
+    
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+    
+    - name: Create Magisk module structure
+      run: |
+        # Determine version
+        if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          VERSION=${GITHUB_REF#refs/tags/v}
+        else
+          VERSION=$(date +%Y%m%d)
+        fi
+        
+        MODULE_NAME="Zygisk-Il2CppDumper"
+        MODULE_DIR="$MODULE_NAME-$VERSION"
+        
+        # Create module directory
+        mkdir -p $MODULE_DIR/zygisk
+        
+        # Copy libraries to correct locations
+        find artifacts -name "Il2CppDumper.so" | while read file; do
+          if echo "$file" | grep -q "arm64-v8a"; then
+            cp "$file" $MODULE_DIR/zygisk/arm64-v8a.so
+          elif echo "$file" | grep -q "armeabi-v7a"; then
+            cp "$file" $MODULE_DIR/zygisk/armeabi-v7a.so
+          elif echo "$file" | grep -q "x86_64"; then
+            cp "$file" $MODULE_DIR/zygisk/x86_64.so
+          fi
+        done
+        
+        # Create module.prop
+        cat > $MODULE_DIR/module.prop << EOF
+        id=zygisk_il2cppdumper
+        name=Zygisk Il2CppDumper
+        version=v$VERSION
+        versionCode=$(date +%Y%m%d)
+        author=Perfare
+        description=Dump Il2Cpp data at runtime with Zygisk
+        EOF
+        
+        # Create service.sh
+        cat > $MODULE_DIR/service.sh << 'EOF'
+        #!/system/bin/sh
+        # This script will be executed in late_start service mode
+        MODDIR=${0%/*}
+        EOF
+        chmod +x $MODULE_DIR/service.sh
+        
+        # Create customize.sh
+        cat > $MODULE_DIR/customize.sh << 'EOF'
+        #!/system/bin/sh
+        SKIPUNZIP=1
+        
+        ui_print "- Installing Zygisk Il2CppDumper"
+        ui_print "- Architecture: $ARCH"
+        
+        # Extract module files
+        unzip -o "$ZIPFILE" 'module.prop' -d $MODPATH >&2
+        unzip -o "$ZIPFILE" 'service.sh' -d $MODPATH >&2
+        
+        # Copy Zygisk library based on architecture
+        case "$ARCH" in
+          arm64)
+            unzip -o "$ZIPFILE" 'zygisk/arm64-v8a.so' -d $MODPATH >&2
+            mv "$MODPATH/zygisk/arm64-v8a.so" "$MODPATH/zygisk/Il2CppDumper.so"
+            ;;
+          arm)
+            unzip -o "$ZIPFILE" 'zygisk/armeabi-v7a.so' -d $MODPATH >&2
+            mv "$MODPATH/zygisk/armeabi-v7a.so" "$MODPATH/zygisk/Il2CppDumper.so"
+            ;;
+          x64)
+            unzip -o "$ZIPFILE" 'zygisk/x86_64.so' -d $MODPATH >&2
+            mv "$MODPATH/zygisk/x86_64.so" "$MODPATH/zygisk/Il2CppDumper.so"
+            ;;
+        esac
+        
+        # Set permissions
+        set_perm_recursive $MODPATH 0 0 0755 0644
+        set_perm $MODPATH/service.sh 0 0 0755
+        EOF
+        chmod +x $MODULE_DIR/customize.sh
+        
+        # Create META-INF directory
+        mkdir -p $MODULE_DIR/META-INF/com/google/android
+        cat > $MODULE_DIR/META-INF/com/google/android/update-binary << 'EOF'
+        #!/sbin/sh
+        # Dummy update-binary for Magisk module
+        exit 0
+        EOF
+        chmod +x $MODULE_DIR/META-INF/com/google/android/update-binary
+        
+        cat > $MODULE_DIR/META-INF/com/google/android/updater-script << 'EOF'
+        # Dummy updater-script
+        ui_print("Flashing Zygisk-Il2CppDumper");
+        EOF
+        
+        # Create zip file
+        cd $MODULE_DIR
+        zip -r9 ../$MODULE_DIR.zip .
+        cd ..
+        
+        # Show created files
+        echo "Created module: $MODULE_DIR.zip"
+        ls -lh *.zip
+    
+    - name: Upload Magisk module
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.BUILD_TYPE }}-Magisk-Module
+        path: |
+          Zygisk-Il2CppDumper-*.zip      # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
+      run: ctest -C ${{env.BUILD_TYPE}}
+
+      # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
+      run: ctest -C ${{env.BUILD_TYPE}}
+
